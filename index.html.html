@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>楕円ビリヤード（9ボール）</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin:0; background:#0b1220; color:#e5e7eb; font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }
+    .wrap { max-width: 980px; margin: 24px auto; padding: 0 12px; }
+    .bar { display:flex; align-items:center; justify-content:space-between; background:#0f172a; border-radius:12px; padding:10px 12px; gap: 10px; flex-wrap: wrap; }
+    .row { display:flex; align-items:center; gap:10px; }
+    .pill { padding:2px 8px; border-radius:8px; background:#1f2937; }
+    .pill.turn { background:#059669; color:#fff; }
+    .pill.target { background:#0ea5e9; color:#0b1220; font-weight:600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace; }
+    .panel { position:relative; border:1px solid #334155; border-radius:16px; overflow:hidden; box-shadow:0 10px 24px rgba(0,0,0,.3); margin-top:12px; }
+    .overlay { position:absolute; left:8px; top:8px; font-size:12px; background:rgba(0,0,0,.6); padding:4px 8px; border-radius:6px; }
+    .msg { position:absolute; left:8px; bottom:8px; font-size:12px; background:rgba(0,0,0,.6); padding:4px 8px; border-radius:6px; }
+    .banner { position:absolute; right:8px; top:8px; font-size:13px; background:#f59e0b; color:#111827; padding:6px 10px; border-radius:8px; box-shadow:0 6px 18px rgba(0,0,0,.25); display:none; }
+    .modal {
+      position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+      background:rgba(0,0,0,.55);
+    }
+    .card {
+      background:#0f172a; border:1px solid #334155; border-radius:14px; padding:16px 18px; min-width: 280px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.35);
+    }
+    .card h2 { margin:0 0 8px 0; font-size:18px; }
+    .card .sub { opacity:.8; font-size:13px; margin-bottom:12px; }
+    .btn { background:#22c55e; color:#052e12; border:none; border-radius:10px; padding:8px 12px; font-weight:600; cursor:pointer; }
+    .btn:hover { filter:brightness(1.05); }
+    canvas { display:block; background:#0a5a2c; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <strong>楕円ビリヤード（本格9ボール・対戦）</strong>
+      <div class="row">
+        <span class="pill target">ターゲット: <span id="targetNum">1</span></span>
+      </div>
+      <div class="row">
+        <div class="row">
+          <input id="p1name" value="P1" />
+          <span id="p1score" class="pill mono">0</span>
+        </div>
+        <div class="row">
+          <input id="p2name" value="P2" />
+          <span id="p2score" class="pill mono">0</span>
+        </div>
+        <button id="pauseBtn">一時停止</button>
+        <button id="rackBtn">R: 初期配置</button>
+      </div>
+    </div>
+    <div class="panel">
+      <canvas id="table" width="900" height="620"></canvas>
+      <div class="overlay">ドラッグでショット / （BIH中）クリックで手球配置 / Space 一時停止 / R 初期配置</div>
+      <div id="bih" class="banner">手球フリー配置中（テーブルをクリック）</div>
+      <div id="msg" class="msg">最小番号から当ててね！</div>
+
+      <!-- Game Over Modal -->
+      <div id="modal" class="modal">
+        <div class="card">
+          <h2 id="modalTitle">ラウンド終了</h2>
+          <div id="modalSub" class="sub"></div>
+          <button id="nextBtn" class="btn">次のラックへ</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ====== Geometry & Physics ======
+    const W=900,H=620,cx=W/2,cy=H/2,a=360,b=240;
+    const c=Math.sqrt(Math.max(0,a*a-b*b));
+    const R=9,MU=0.85,RESTITUTION=0.96,CUSHION_REST=0.92,MAX_POWER=820,POCKET_R=18;
+    const pocketAngles=[0,Math.PI/3,2*Math.PI/3,Math.PI,4*Math.PI/3,5*Math.PI/3];
+    const pockets=pocketAngles.map(th=>({x:a*Math.cos(th),y:b*Math.sin(th)}));
+    const colors9=['#ffd700','#0000ff','#ff0000','#9400d3','#ffa500','#00ff00','#800000','#000000','#1e90ff'];
+
+    // ====== DOM ======
+    const canvas=document.getElementById('table'), ctx=canvas.getContext('2d');
+    const p1nameEl=document.getElementById('p1name'), p2nameEl=document.getElementById('p2name');
+    const p1scoreEl=document.getElementById('p1score'), p2scoreEl=document.getElementById('p2score');
+    const msgEl=document.getElementById('msg'), pauseBtn=document.getElementById('pauseBtn'), rackBtn=document.getElementById('rackBtn');
+    const bihBanner=document.getElementById('bih'), targetEl=document.getElementById('targetNum');
+    const modal=document.getElementById('modal'), modalTitle=document.getElementById('modalTitle'), modalSub=document.getElementById('modalSub'), nextBtn=document.getElementById('nextBtn');
+
+    // ====== State ======
+    let balls=[]; // {id,x,y,vx,vy,r,m,color,isCue,label}
+    let running=true, aiming=null, last=0, ballInHand=false, shotActive=false;
+    let firstContact=null, pocketedThisShot=[];
+    let requiredLowest=null, touchedRequired=false;
+    let p1Score=0,p2Score=0,currentPlayer=1;
+    let gameOver=false, lastWinner=1;
+
+    function playerName(p){return p===1?p1nameEl.value:p2nameEl.value;}
+    function addScore(p,d){ if(p===1){ p1Score=Math.max(0,p1Score+d); p1scoreEl.textContent=p1Score; } else { p2Score=Math.max(0,p2Score+d); p2scoreEl.textContent=p2Score; } }
+    function allStopped(th=2){ return balls.every(b=>Math.hypot(b.vx,b.vy)<th); }
+    function lowest(){ const ids=balls.filter(b=>!b.isCue).map(b=>b.id); return ids.length?Math.min(...ids):null; }
+
+    function setTurnDisplay(p){
+      p1scoreEl.classList.toggle('turn', p===1);
+      p2scoreEl.classList.toggle('turn', p===2);
+    }
+    function switchTurn(){ currentPlayer=currentPlayer===1?2:1; setTurnDisplay(currentPlayer); }
+
+    function setMsg(t){ msgEl.textContent=t; }
+    function setBIHBanner(show){ bihBanner.style.display = show ? 'block' : 'none'; }
+    function updateTargetLabel(){
+      const t = shotActive ? (requiredLowest ?? lowest()) : lowest();
+      targetEl.textContent = t ?? '-';
+    }
+
+    function openModal(title, sub){
+      modalTitle.textContent = title;
+      modalSub.textContent = sub || '';
+      modal.style.display = 'flex';
+      gameOver = true;
+      running = false;
+    }
+    function closeModal(){
+      modal.style.display = 'none';
+      gameOver = false;
+      running = true;
+    }
+
+// ====== Points-mode rack result ======
+function showRackResult(reason){
+  let title, sub;
+  if(p1Score > p2Score){
+    lastWinner = 1;
+    title = `勝者: ${playerName(1)}`;
+    sub = `${reason}  P1:${p1Score} - P2:${p2Score}`;
+  } else if(p2Score > p1Score){
+    lastWinner = 2;
+    title = `勝者: ${playerName(2)}`;
+    sub = `${reason}  P1:${p1Score} - P2:${p2Score}`;
+  } else {
+    // tie: alternate breaker for next rack
+    lastWinner = (lastWinner===1?2:1);
+    title = '引き分け';
+    sub = `${reason}  ${playerName(1)}:${p1Score} - ${playerName(2)}:${p2Score}`;
+  }
+  openModal(title, sub);
+}
+
+    // ====== Math helpers ======
+    function inside(x,y,A=a,B=b){ return (x*x)/(A*A)+(y*y)/(B*B) <= 1; }
+    function project(x,y,A=a,B=b){ const f=(x*x)/(A*A)+(y*y)/(B*B); if(f===0) return {x:0,y:0}; const s=1/Math.sqrt(f); return {x:x*s,y:y*s}; }
+    function reflect(vx,vy,bx,by,A,B){ const nx=bx/(A*A),ny=by/(B*B),nlen=Math.hypot(nx,ny)||1,ux=nx/nlen,uy=ny/nlen,d=vx*ux+vy*uy; return {vx:(vx-2*d*ux)*CUSHION_REST,vy:(vy-2*d*uy)*CUSHION_REST}; }
+
+    // ====== Game helpers ======
+    function rack(){
+      const cue={id:0,x:-c*0.9,y:0,vx:0,vy:0,r:R,m:1,color:'#f1f5f9',isCue:true};
+
+      // Diamond rack: 1 at head; 9 center; others random
+      const gap = R*2.05;
+      const headX = +c*0.55, headY = 0;
+      const diamondOffsets = [
+        [0, 0],
+        [gap, -gap/2], [gap, +gap/2],
+        [2*gap, -gap], [2*gap, 0], [2*gap, +gap],
+        [3*gap, -gap/2], [3*gap, +gap/2],
+        [4*gap, 0]
+      ];
+      const positions = diamondOffsets.map(([dx,dy]) => ({ x: headX + dx, y: headY + dy }));
+      const objs=[];
+      objs.push({ id:1, x:positions[0].x, y:positions[0].y, vx:0, vy:0, r:R, m:1, color:colors9[0], label:'1' });
+      objs.push({ id:9, x:positions[4].x, y:positions[4].y, vx:0, vy:0, r:R, m:1, color:colors9[8], label:'9' });
+      const remainIds=[2,3,4,5,6,7,8];
+      for(let i=remainIds.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [remainIds[i],remainIds[j]]=[remainIds[j],remainIds[i]]; }
+      const remainSlots=[1,2,3,5,6,7,8];
+      for(let k=0;k<remainIds.length;k++){
+        const id=remainIds[k], idx=remainSlots[k], p=positions[idx], color=colors9[id-1];
+        objs.push({ id, x:p.x, y:p.y, vx:0, vy:0, r:R, m:1, color, label:String(id) });
+      }
+
+      balls=[cue, ...objs];
+      firstContact=null; pocketedThisShot=[]; shotActive=false;
+      requiredLowest=null; touchedRequired=false;
+      setTurnDisplay(currentPlayer);
+      setMsg('新ラック（正式ダイヤ配置）：最小番号から当ててね！');
+      setBIHBanner(false);
+      ballInHand=false;
+      updateTargetLabel();
+    }
+
+    function spotBall(id){
+      const A=a-R,B=b-R;
+      const baseX = +c*0.55 + 2*R*2.05, baseY = 0;
+      const gap = R*2.05;
+      const tryPoints = [
+        [baseX, baseY],
+        [baseX + gap, baseY],
+        [baseX - gap, baseY],
+        [baseX, baseY + gap],
+        [baseX, baseY - gap],
+        [baseX + gap, baseY + gap/2],
+        [baseX + gap, baseY - gap/2],
+      ];
+      function freeAt(x,y){ return balls.every(b=>Math.hypot(b.x-x,b.y-y) >= b.r+R+1); }
+      function place(x,y){ const idx=balls.findIndex(b=>b.id===id); if(idx>=0){ const b=balls[idx]; b.x=x; b.y=y; b.vx=0; b.vy=0; } }
+      for(const [x,y] of tryPoints){
+        const f=(x*x)/(A*A)+(y*y)/(B*B);
+        if(f<=1 && freeAt(x,y)){ place(x,y); return; }
+      }
+      place(Math.min(Math.max(baseX,-A),A), Math.min(Math.max(baseY,-B),B));
+    }
+
+    // ====== Input ======
+    canvas.addEventListener('pointerdown', (e)=>{
+      const r=canvas.getBoundingClientRect(); const x=e.clientX-r.left-cx, y=e.clientY-r.top-cy;
+      const cue=balls.find(b=>b.isCue);
+
+      if(allStopped() && ballInHand && inside(x,y,a-R,b-R)){
+        cue.x=x; cue.y=y; cue.vx=cue.vy=0; ballInHand=false; setMsg('手球を配置しました'); setBIHBanner(false); updateTargetLabel(); return;
+      }
+      if(!allStopped() || gameOver) return;
+      if(Math.hypot(x-cue.x,y-cue.y)<=R*2.2){ aiming={active:true,sx:cue.x,sy:cue.y,mx:x,my:y}; }
+    });
+    window.addEventListener('pointermove', (e)=>{
+      if(!aiming?.active) return;
+      const r=canvas.getBoundingClientRect(); const x=e.clientX-r.left-cx, y=e.clientY-r.top-cy;
+      aiming.mx=x; aiming.my=y;
+    });
+    window.addEventListener('pointerup', ()=>{
+      const aim=aiming; if(!aim?.active) return; aiming=null;
+      const cue=balls.find(b=>b.isCue);
+      const dx=aim.sx-aim.mx, dy=aim.sy-aim.my, dist=Math.hypot(dx,dy);
+      const power=Math.min(MAX_POWER, dist*8); if(power<5) return;
+      const ux=dx/(dist||1), uy=dy/(dist||1);
+      cue.vx=ux*power; cue.vy=uy*power;
+      requiredLowest = lowest(); // capture target at shot start
+      touchedRequired = false;
+      firstContact=null; pocketedThisShot=[]; shotActive=true;
+      setMsg(playerName(currentPlayer)+' のショット！');
+      updateTargetLabel();
+    });
+
+    window.addEventListener('keydown', (e)=>{
+      if(e.key===' '){ running=!running; pauseBtn.textContent = running? '一時停止' : '再開'; }
+      if(e.key==='r' || e.key==='R'){ rack(); }
+    });
+    pauseBtn.addEventListener('click', ()=>{ running=!running; pauseBtn.textContent = running? '一時停止' : '再開'; });
+    rackBtn.addEventListener('click', rack);
+    nextBtn.addEventListener('click', ()=>{
+      closeModal();
+      // reset scores for a fresh rack in points mode
+      p1Score = 0; p2Score = 0;
+      p1scoreEl.textContent = '0';
+      p2scoreEl.textContent = '0';
+      // next breaker: lastWinner (or alternated if draw)
+      currentPlayer = lastWinner;
+      setTurnDisplay(currentPlayer);
+      rack();
+    });
+
+    // ====== Simulation ======
+    let tAccum=0;
+    function update(dt){
+      const A=a-R,B=b-R;
+      const sunk=[];
+      tAccum += dt;
+
+      // integrate & walls/pockets
+      for(const ball of balls){
+        const damp=Math.exp(-MU*dt); ball.vx*=damp; ball.vy*=damp;
+        let nx=ball.x+ball.vx*dt, ny=ball.y+ball.vy*dt;
+        for(const pk of pockets){ if(Math.hypot(nx-pk.x,ny-pk.y)<POCKET_R-1){ sunk.push(ball.id); break; } }
+        if(sunk.includes(ball.id)) continue;
+        const f=(nx*nx)/(A*A)+(ny*ny)/(B*B);
+        if(f>1){
+          let near=false; for(const pk of pockets){ if(Math.hypot(nx-pk.x,ny-pk.y)<POCKET_R+6){ near=true; break; } }
+          if(near){ sunk.push(ball.id); }
+          else { const pb=project(nx,ny,A,B), rv=reflect(ball.vx,ball.vy,pb.x,pb.y,A,B); ball.vx=rv.vx; ball.vy=rv.vy; ball.x=pb.x*0.999; ball.y=pb.y*0.999; }
+        } else { ball.x=nx; ball.y=ny; }
+        if(Math.hypot(ball.vx,ball.vy)<1){ ball.vx=0; ball.vy=0; }
+      }
+
+      // collisions
+      for(let i=0;i<balls.length;i++){
+        for(let j=i+1;j<balls.length;j++){
+          const A=balls[i], B=balls[j];
+          const dx=B.x-A.x, dy=B.y-A.y, dist=Math.hypot(dx,dy), minDist=A.r+B.r;
+          if(dist>0 && dist<minDist){
+            const ux=dx/dist, uy=dy/dist, overlap=minDist-dist;
+            A.x-=ux*(overlap/2); A.y-=uy*(overlap/2); B.x+=ux*(overlap/2); B.y+=uy*(overlap/2);
+            const rvx=B.vx-A.vx, rvy=B.vy-A.vy, vn=rvx*ux+rvy*uy;
+            if(vn<0){ const e=RESTITUTION, j=-(1+e)*vn/(1/A.m+1/B.m), jx=j*ux, jy=j*uy; A.vx-=jx/A.m; A.vy-=jy/A.m; B.vx+=jx/B.m; B.vy+=jy/B.m; }
+            const cue=A.isCue?A:(B.isCue?B:null);
+            const other=cue?(cue===A?B:A):null;
+            if(cue && other && !other.isCue){
+              if(firstContact===null){ firstContact = other.id; }
+              if(requiredLowest!=null && other.id===requiredLowest){ touchedRequired = true; }
+            }
+          }
+        }
+      }
+
+      // sunk processing
+      if(sunk.length){
+        sunk.sort((a,b)=>(a===0?-1:1));
+        for(const id of sunk){
+          const idx=balls.findIndex(b=>b.id===id);
+          if(idx>=0){
+            const b=balls[idx];
+            if(b.isCue){
+              addScore(currentPlayer,-1);
+              b.x=-c*0.9; b.y=0; b.vx=0; b.vy=0;
+              setMsg('スクラッチ：-1点、相手に手球（テーブルをクリックで手球配置）');
+              ballInHand=true;
+              setBIHBanner(true);
+            } else {
+              balls.splice(idx,1);
+              pocketedThisShot.push(id);
+            }
+          }
+        }
+      }
+
+      // shot evaluation (once, when all stopped)
+      if(shotActive && allStopped()){
+        const foul = (requiredLowest!=null && !touchedRequired);
+
+        if(foul){
+          if(pocketedThisShot.includes(9)){
+            const id=9;
+            if(!balls.some(b=>b.id===id)){
+              const color=colors9[id-1];
+              balls.push({id, x:0, y:0, vx:0, vy:0, r:R, m:1, color, label:String(id)});
+            }
+            spotBall(9);
+          }
+          addScore(currentPlayer,-1);
+          setMsg('ファウル：相手にボールインハンド（9のみスポット戻し）');
+          switchTurn();
+          ballInHand=true;
+          setBIHBanner(true);
+        } else {
+          if(pocketedThisShot.includes(9)){
+            lastWinner = currentPlayer;
+            addScore(currentPlayer,3);
+            openModal(`勝者: ${playerName(currentPlayer)}`, '9ボール達成！ +3点');
+          } else {
+            let gained=0; for(const id of pocketedThisShot){ gained += 1; }
+            if(gained>0) addScore(currentPlayer,gained);
+            if(!balls.some(b=>!b.isCue)){
+              lastWinner = currentPlayer;
+              addScore(currentPlayer,3);
+              openModal(`勝者: ${playerName(currentPlayer)}`, '全クリア！ +3点');
+            } else {
+              if(gained>0) setMsg('+'+gained+'点 続行');
+              else { switchTurn(); setMsg(playerName(currentPlayer)+' の番'); }
+            }
+          }
+        }
+        firstContact=null; pocketedThisShot=[]; shotActive=false;
+        requiredLowest=null; touchedRequired=false;
+        updateTargetLabel();
+      }
+    }
+
+    function draw(){
+      ctx.clearRect(0,0,W,H);
+      ctx.fillStyle='#0a5a2c'; ctx.fillRect(0,0,W,H);
+      ctx.save(); ctx.translate(cx,cy);
+      // cushion
+      ctx.beginPath(); ctx.ellipse(0,0,a,b,0,0,Math.PI*2); ctx.strokeStyle='#77e0ff'; ctx.lineWidth=3; ctx.stroke();
+      // pockets
+      for(const pk of pockets){ ctx.fillStyle='#0f172a'; ctx.beginPath(); ctx.arc(pk.x,pk.y,POCKET_R+3,0,Math.PI*2); ctx.fill(); ctx.fillStyle='#020617'; ctx.beginPath(); ctx.arc(pk.x,pk.y,POCKET_R,0,Math.PI*2); ctx.fill(); }
+      // foci
+      ctx.fillStyle='#ffd166'; ctx.beginPath(); ctx.arc(-c,0,4,0,Math.PI*2); ctx.fill(); ctx.beginPath(); ctx.arc(c,0,4,0,Math.PI*2); ctx.fill();
+
+      // target-ball highlight (pulse)
+      const targetId = shotActive ? (requiredLowest ?? lowest()) : lowest();
+      if(targetId!=null){
+        const tb = balls.find(b=>b.id===targetId);
+        if(tb){
+          const pulse = 1 + 0.15*Math.sin(performance.now()/250);
+          ctx.save();
+          ctx.globalAlpha = 0.9;
+          ctx.strokeStyle = '#38bdf8'; // cyan ring
+          ctx.lineWidth = 4;
+          ctx.beginPath(); ctx.arc(tb.x, tb.y, tb.r*1.9*pulse, 0, Math.PI*2); ctx.stroke();
+          ctx.globalAlpha = 0.35;
+          ctx.lineWidth = 10;
+          ctx.beginPath(); ctx.arc(tb.x, tb.y, tb.r*2.6*pulse, 0, Math.PI*2); ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      // balls
+      for(const b of balls){
+        ctx.fillStyle=b.color; ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fill();
+        if(!b.isCue && b.label){ ctx.fillStyle='#fff'; ctx.font='10px ui-monospace,Menlo,monospace'; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(b.label, b.x, b.y+0.5); }
+        if(b.isCue){ ctx.strokeStyle='#94a3b8'; ctx.lineWidth=1; ctx.stroke(); }
+      }
+      // aiming
+      if(aiming?.active){
+        const dx=aiming.sx-aiming.mx, dy=aiming.sy-aiming.my;
+        const len=Math.min(MAX_POWER, Math.hypot(dx,dy)*8);
+        const den=Math.hypot(dx,dy)||1, ux=dx/den, uy=dy/den;
+        ctx.strokeStyle='#22d3ee'; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(aiming.sx,aiming.sy); ctx.lineTo(aiming.sx+ux*len*0.12, aiming.sy+uy*len*0.12); ctx.stroke();
+        ctx.strokeStyle='#eab308'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(aiming.sx,aiming.sy); ctx.lineTo(aiming.sx+ux*40, aiming.sy+uy*40); ctx.stroke();
+      }
+      ctx.restore();
+
+      updateTargetLabel();
+    }
+
+    function loop(t){
+      if(!last) last=t;
+      const dt=Math.min(0.03, (t-last)/1000 || 0.016);
+      last=t;
+      if(running) update(dt);
+      draw();
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+
+    // Init
+    rack();
+  </script>
+</body>
+</html>
